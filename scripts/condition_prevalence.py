@@ -1,0 +1,231 @@
+#!/usr/bin/env python3
+"""
+Week 3 — Candidate "life-saving drug" conditions in NHANES RXQ_RX, 2013–March 2020.
+
+For each candidate condition, counts the number of surveyed people whose
+reason-for-use codes (RXDRSC1–3) fall in the condition's ICD-10-CM
+3-character category, and their weighted share of the US population.
+
+Rules (from the week-3 instructions):
+  * Only cycles 2013-2014, 2015-2016 and 2017-March 2020 (reason codes start 2013).
+  * Match on the first 3 characters of the code (E10 yes; E10.2 too specific; E too broad).
+  * Count PEOPLE (unique SEQN), not drug rows. A person counts once if ANY of
+    their drugs has a matching code in ANY of RXDRSC1/2/3.
+  * Codes ending in "P" are NHANES "prevention" codes; count them separately.
+  * Interview weight = WTINT2YR (2013-14, 2015-16) or WTINTPRP (2017-Mar 2020).
+  * Share = sum of weights of matching people / sum of weights of everyone in
+    the period (~950 million).
+
+Usage:
+    python scripts/condition_prevalence.py data/nhanes_2003_2020_rx_demo_drug.csv \
+        --out outputs/justin_conditions.tsv
+
+The input CSV is the team's aggregated NHANES RXQ_RX + DEMO file (one row per
+drug per person; people with no drugs have one row). It is NOT committed to
+the repo (65 MB); download it from the shared Drive into data/.
+"""
+import argparse
+import csv
+import sys
+
+import numpy as np
+import pandas as pd
+
+CYCLES_2013_PLUS = ["2013-2014", "2015-2016", "2017-March 2020 pre-pandemic"]
+
+# Output columns, in the same order as the "Justin" sheet of "Week 3 Results".
+HEADER = [
+    "Condition",
+    "ICD-10-CM code(s)",
+    "Life-saving drug(s)",
+    "Found in data?",
+    "Raw # people in data with it (without P code)",
+    "Share of US population (%) (without P code)",
+    "Raw # people with P code for this condition",
+    "Source(s)",
+    "Notes",
+]
+
+# Candidate conditions: (name, 3-char categories, code text, drugs, sources, notes).
+# "{PSHARE}" in notes is replaced by the weighted P-code share at run time.
+# Two deliberate deviations from the pure 3-character rule are documented in
+# the notes: T78 (all T78.40 "Allergy, unspecified") is excluded from the
+# anaphylaxis row, and B18 (all B18.2 hepatitis C) is excluded from hepatitis B.
+CONDITIONS = [
+    ("HIV infection", ["B20"],
+     "B20 Human immunodeficiency virus [HIV] disease (Z21 asymptomatic HIV: not in data)",
+     "Antiretroviral therapy (bictegravir/emtricitabine/TAF, dolutegravir, darunavir/ritonavir, efavirenz/emtricitabine/tenofovir)",
+     "HHS/NIH Adult & Adolescent ARV Guidelines; INSIGHT START Study Group, NEJM 2015",
+     "All 41 are on an ARV. Emtricitabine/tenofovir is also PrEP for HIV-negative people, so identify by B20, not by drug."),
+    ("Solid organ transplant", ["Z94", "T86"],
+     "Z94 Transplanted organ and tissue status (Z94.0 kidney); T86 Complications of transplanted organs (only T86.9P 'Prevent transplanted organ and tissue rejection')",
+     "Tacrolimus, mycophenolate, oral cyclosporine, sirolimus/everolimus, azathioprine",
+     "KDIGO 2009 Kidney Transplant Recipient Guideline; Butler et al., Transplantation 2004",
+     "Appears almost entirely as the P code T86.9P, so the P column is the real transplant count. {PSHARE}. Same drugs also used for lupus/RA/IBD."),
+    ("Type 1 diabetes", ["E10"],
+     "E10 Type 1 diabetes mellitus (E10, E10.2, E10.4)",
+     "Insulin (glargine/detemir + aspart/lispro)",
+     "ADA Standards of Care in Diabetes",
+     "40/41 on insulin. Insulin alone is not specific (most insulin users are E11), so define by E10. Some T1D may self-report as E11."),
+    ("Atrial fibrillation", ["I48"],
+     "I48 Atrial fibrillation and flutter (I48.9, I48.91, I48.92)",
+     "Oral anticoagulants: warfarin, apixaban, rivaroxaban, dabigatran, edoxaban",
+     "2023 ACC/AHA/ACCP/HRS AF Guideline (Joglar et al., Circulation 2024); Hart, Pearce & Aguilar, Ann Intern Med 2007",
+     "Only 90/201 are on an OAC (rest on rate control). Many OAC users instead report D75.9P 'Prevent blood clots' (456 people, 1.4%), which is shared with VTE/valves, so AF-specific anticoagulation is undercounted."),
+    ("Venous thromboembolism (DVT / pulmonary embolism)", ["I26", "I80", "I82"],
+     "I26 Pulmonary embolism; I80 Phlebitis and thrombophlebitis (I80.3); I82 Other venous embolism/thrombosis: not in data",
+     "Anticoagulants: apixaban, rivaroxaban, warfarin, dabigatran, enoxaparin",
+     "Barritt & Jordan, Lancet 1960; Stevens et al., CHEST VTE Guideline 2021",
+     "I26 = 25 people, I80 = 71; 6 overlap, so 90 unique. 62/90 on an anticoagulant. Generic P code D75.9P 'Prevent blood clots' (456 people) likely holds many VTE patients but cannot be split from AF."),
+    ("Cardiac/vascular implant (prosthetic heart valve, stent, bypass, pacemaker)", ["Z95"],
+     "Z95 Presence of cardiac and vascular implants and grafts (Z95, Z95.0 pacemaker, Z95.1 CABG, Z95.2 prosthetic heart valve, Z95.5 coronary stent, Z95.9)",
+     "Warfarin (mechanical valve); P2Y12 inhibitor + aspirin (stent)",
+     "2020 ACC/AHA Valvular Heart Disease Guideline (Otto et al., Circulation 2021); 2016 ACC/AHA DAPT Focused Update (Levine et al., JACC)",
+     "At 3 characters Z95 lumps valves, stents, bypass and pacemakers; 2015+ coding is mostly bare 'Z95' (23 of 39). Only Z95.2 (7 people, all on warfarin) is the mechanical-valve case."),
+    ("Heart attack / ischemic heart disease", ["I21", "I25"],
+     "I21 Acute myocardial infarction (STEMI/NSTEMI); I25 Chronic ischemic heart disease (I25.9); P: I21.P Prevent heart attack",
+     "P2Y12 inhibitors (clopidogrel, ticagrelor, prasugrel) + aspirin after MI/stent",
+     "2016 ACC/AHA DAPT Focused Update (Levine et al., JACC 2016)",
+     "I21 = 57, I25 = 7, 64 unique. 33/64 on a P2Y12. P code I21.P is huge ({PSHARE}) but only 70 of 498 are on a P2Y12; most are aspirin/statin primary prevention, so P here mostly is not 'has the condition'."),
+    ("Heart failure", ["I50"],
+     "I50 Heart failure (I50.9)",
+     "Sacubitril/valsartan (HF-only); SGLT2 inhibitors, spironolactone, beta-blockers",
+     "PARADIGM-HF (McMurray et al., NEJM 2014); 2022 AHA/ACC/HFSA HF Guideline",
+     "Only 8/312 take sacubitril/valsartan; other HF drugs are shared with hypertension/diabetes. Fits 'has condition' well, fits 'unique drug' poorly."),
+    ("Breast cancer (hormone receptor-positive)", ["C50"],
+     "C50 Malignant neoplasm of breast; P: C50.P Prevent breast cancer (split across 'Prevent breast cancer' 13 and typo 'Prevent barest cancer' 17)",
+     "Tamoxifen; aromatase inhibitors (anastrozole, letrozole, exemestane)",
+     "EBCTCG, Lancet 2011 (tamoxifen); EBCTCG, Lancet 2015 (aromatase inhibitors)",
+     "51/56 on one of these drugs. {PSHARE}. Many C50.P people are probably survivors on adjuvant therapy who said 'prevent', so P may belong with the treated group here."),
+    ("Prostate cancer (advanced/metastatic)", ["C61"],
+     "C61 Malignant neoplasm of prostate; P: C61.P Prevent prostate cancer",
+     "Abiraterone, enzalutamide, apalutamide, bicalutamide; leuprolide",
+     "LATITUDE (Fizazi et al., NEJM 2017); ENZAMET (Davis et al., NEJM 2019)",
+     "16/24 on an oral antiandrogen. Life-saving mainly in metastatic disease. Injected ADT may be missed."),
+    ("Chronic myeloid leukemia", ["C92"],
+     "C92 Myeloid leukemia: NOT in data (TKI users are coded C95.9 leukemia unspecified, C96.9, C80.1P)",
+     "Imatinib, dasatinib, nilotinib, bosutinib",
+     "IRIS 10-year follow-up (Hochhaus et al., NEJM 2017)",
+     "Not findable by code; only 5 TKI users since 2013. Drop."),
+    ("Epilepsy", ["G40", "R56"],
+     "G40 Epilepsy and recurrent seizures; R56 Convulsions (R56.9); P: G40.P Prevent seizures",
+     "Levetiracetam, phenytoin, lacosamide, oxcarbazepine, carbamazepine, lamotrigine, valproate",
+     "RANSOM study (Faught et al., Neurology 2008)",
+     "G40 = 247, R56 = 1. 220/248 on an antiseizure drug. Levetiracetam/phenytoin/lacosamide are seizure-specific; lamotrigine, valproate, topiramate, gabapentin are not."),
+    ("Adrenal insufficiency", ["E27", "E23"],
+     "E27 Other disorders of adrenal gland (E27.1 primary adrenocortical insufficiency, E27.40, E27.9 unspecified); E23 Hypofunction of pituitary: not in data",
+     "Oral hydrocortisone, fludrocortisone, prednisone",
+     "Endocrine Society Primary Adrenal Insufficiency Guideline (Bornstein et al., JCEM 2016)",
+     "9/11 on hydrocortisone/fludrocortisone. E27.9 (8 of 11) is 'adrenal disorder unspecified', so some may not be insufficiency. Exclude topical/otic hydrocortisone."),
+    ("Myasthenia gravis", ["G70"],
+     "G70 Myasthenia gravis: NOT in data (5 pyridostigmine users coded 55555/99999/M62.81)",
+     "Pyridostigmine; prednisone/azathioprine",
+     "International Consensus Guidance for MG 2020 Update (Narayanaswami et al., Neurology 2021)",
+     "Not findable by code. Drop."),
+    ("Pulmonary hypertension", ["I27"],
+     "I27 Other pulmonary heart diseases (only I27.9 unspecified)",
+     "Bosentan, ambrisentan, macitentan, riociguat, treprostinil, selexipag; sildenafil/tadalafil",
+     "NIH Registry (D'Alonzo et al., Ann Intern Med 1991); 2022 ESC/ERS PH Guidelines",
+     "4/9 on a PAH-specific drug (ERA/riociguat/treprostinil). I27.9 does not separate PAH (group 1) from other pulmonary hypertension."),
+    ("Chronic hepatitis B", ["B19"],
+     "B19 Unspecified viral hepatitis (B19, B19.1 hepatitis B unspecified). B16 acute hep B: not in data. B18 chronic viral hepatitis is present (3 people) but all are B18.2 = hepatitis C, so excluded",
+     "Entecavir, tenofovir (TDF/TAF)",
+     "AASLD 2018 Hepatitis B Guidance (Terrault et al., Hepatology 2018)",
+     "Only 1 person explicitly hep B; 5 of 11 B19 people are on entecavir (HBV-only drug). Weak; consider defining as 'B19 + entecavir'."),
+    ("Cystic fibrosis", ["E84"],
+     "E84 Cystic fibrosis: NOT in data (pancrelipase users coded K86/K87 pancreatic disease)",
+     "Elexacaftor/tezacaftor/ivacaftor, ivacaftor; pancrelipase, dornase alfa",
+     "Middleton et al., NEJM 2019; CF Foundation Patient Registry",
+     "Not findable by code. Drop."),
+    ("Opioid use disorder", ["F11"],
+     "F11 Opioid related disorders (F11.2 opioid dependence, F11.23 with withdrawal)",
+     "Buprenorphine (+/- naloxone), methadone, extended-release naltrexone",
+     "Sordo et al., BMJ 2017; Larochelle et al., Ann Intern Med 2018",
+     "All 29 on MOUD. Methadone/buprenorphine are also prescribed for pain; clinic-dispensed methadone may be under-reported."),
+    ("Severe allergy / anaphylaxis risk", ["Z91"],
+     "Z91 Personal risk factors (Z91.01 food allergy status, Z91.030 bee allergy status). T78 is present (508 people) but is entirely T78.40 'Allergy, unspecified' = antihistamine users, so excluded",
+     "Epinephrine auto-injector",
+     "Anaphylaxis 2020 Practice Parameter Update (Shaker et al., JACI 2020)",
+     "Only 3 people, none on epinephrine. Rescue med not captured well by a 30-day prescription survey. Drop."),
+    ("Bipolar disorder", ["F31"],
+     "F31 Bipolar disorder (F31.9)",
+     "Lithium",
+     "Cipriani et al., BMJ 2013",
+     "Only 20/195 on lithium; other bipolar drugs are non-specific. Mortality pathway is suicide."),
+]
+
+
+def load(path):
+    cols = ["SEQN", "cycle", "RXDRSC1", "RXDRSC2", "RXDRSC3", "WTINT2YR", "WTINTPRP"]
+    df = pd.read_csv(path, low_memory=False, usecols=cols)
+    df = df[df.cycle.isin(CYCLES_2013_PLUS)].copy()
+    df["w"] = np.where(df.cycle.str.startswith("2017"), df.WTINTPRP, df.WTINT2YR)
+    return df
+
+
+def people_table(df):
+    """One row per person with their interview weight; sanity-checks the weights."""
+    nuniq = df.groupby("SEQN").w.nunique()
+    assert (nuniq == 1).all(), "interview weight varies within a person"
+    ppl = df.drop_duplicates("SEQN")[["SEQN", "cycle", "w"]]
+    assert ppl.w.notna().all(), "missing interview weights"
+    return ppl
+
+
+def long_codes(df):
+    """One row per (person, reason code) across RXDRSC1-3."""
+    parts = [df[["SEQN"]].assign(c=df[f"RXDRSC{i}"]) for i in (1, 2, 3)]
+    long = pd.concat(parts).dropna(subset=["c"])
+    long["c"] = long.c.astype(str).str.strip()
+    long["isP"] = long.c.str.endswith("P")
+    long["cat"] = long.c.str[:3]
+    return long
+
+
+def count_condition(long, ppl, cats):
+    m = long[long.cat.isin(cats)]
+    out = {}
+    for label, sub in (("n", m[~m.isP]), ("p", m[m.isP])):
+        ids = sub.SEQN.unique()
+        out[label] = len(ids)
+        out[label + "w"] = ppl[ppl.SEQN.isin(ids)].w.sum()
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("csv")
+    ap.add_argument("--out", default="outputs/justin_conditions.tsv")
+    args = ap.parse_args()
+
+    df = load(args.csv)
+    ppl = people_table(df)
+    total = ppl.w.sum()
+    print(f"people: {len(ppl):,}  total weight: {total/1e6:.1f} million", file=sys.stderr)
+    print(ppl.groupby("cycle").w.sum().div(1e6).round(1).to_dict(), file=sys.stderr)
+
+    long = long_codes(df)
+    pct = lambda w: f"{100 * w / total:.3f}"
+
+    rows = []
+    for name, cats, codes, drugs, src, notes in CONDITIONS:
+        r = count_condition(long, ppl, cats)
+        found = "Yes" if r["n"] + r["p"] else "No"
+        pshare = f"P-code share = {pct(r['pw'])}% (~{r['pw']/1e6:.2f}M Americans)"
+        if "{PSHARE}" in notes:
+            notes = notes.replace("{PSHARE}", pshare)
+        elif r["p"]:
+            notes += f" P-code share = {pct(r['pw'])}%."
+        rows.append([name, codes, drugs, found, r["n"], pct(r["nw"]) if r["n"] else "0.000", r["p"], src, notes])
+
+    with open(args.out, "w", newline="") as f:
+        w = csv.writer(f, delimiter="\t", lineterminator="\n")
+        w.writerow(HEADER)
+        w.writerows(rows)
+    for row in rows:
+        print(f"{row[0][:50]:<51}{row[4]:>5} {row[5]:>7}%  P={row[6]}", file=sys.stderr)
+    print(f"wrote {args.out}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()
